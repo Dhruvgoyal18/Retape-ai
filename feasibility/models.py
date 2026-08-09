@@ -11,6 +11,7 @@ import json
 from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -38,7 +39,12 @@ class Client:
 @dataclass
 class Offer:
     creditor: str
-    current_balance_cents: int
+    # The creditor's balance being settled. Named distinctly from the client's
+    # SDA `current_balance_cents` to avoid conflating the two (see ASSIGNMENT.md
+    # section 3, "Note on a renamed field"). The loader also accepts the older
+    # `current_balance_cents` key for backward compatibility with existing
+    # offer.json fixtures.
+    creditor_balance_cents: int
     original_balance_cents: int
     settlement_pct: float
     # Optional. When omitted, default to the end of the month of first_draft_date
@@ -137,9 +143,10 @@ def load_client(path: str | Path) -> Client:
 def load_offer(path: str | Path) -> Offer:
     raw = json.loads(Path(path).read_text())
     fpd = raw.get("first_payment_date")
+    creditor_balance = raw.get("creditor_balance_cents", raw.get("current_balance_cents"))
     return Offer(
         creditor=raw["creditor"],
-        current_balance_cents=int(raw["current_balance_cents"]),
+        creditor_balance_cents=int(creditor_balance),
         original_balance_cents=int(raw["original_balance_cents"]),
         settlement_pct=float(raw["settlement_pct"]),
         first_payment_date=_d(fpd) if fpd else None,
@@ -171,9 +178,32 @@ def load_case(case_dir: str | Path) -> tuple[Client, Offer, CreditorRules]:
     )
 
 
+def round_half_up(x: float | int | Decimal) -> int:
+    """Round to the nearest integer, ties rounding away from zero.
+
+    Accepts a pre-computed ``Decimal`` (preferred — see ``pct_of``) or a plain
+    number. For plain floats, converts via ``str(x)`` rather than
+    ``Decimal(x)`` so the decimal literal that was intended (e.g. ``0.125``)
+    is what gets rounded, not whatever imprecise binary-float value backs it.
+    """
+    d = x if isinstance(x, Decimal) else Decimal(str(x))
+    return int(d.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def pct_of(pct: float, amount_cents: int) -> Decimal:
+    """``pct * amount_cents`` computed entirely in Decimal.
+
+    Multiplying as floats first (``pct * amount_cents``) and only converting
+    to ``Decimal`` afterwards would already bake in binary-float drift before
+    rounding ever sees it. Converting each operand to ``Decimal`` via
+    ``str()`` first, then multiplying, keeps the arithmetic exact.
+    """
+    return Decimal(str(pct)) * Decimal(amount_cents)
+
+
 def offer_total_cents(offer: Offer) -> int:
-    return round(offer.settlement_pct * offer.current_balance_cents)
+    return round_half_up(pct_of(offer.settlement_pct, offer.creditor_balance_cents))
 
 
 def program_fee_cents(offer: Offer, rules: CreditorRules) -> int:
-    return round(rules.program_fee_pct * offer.original_balance_cents)
+    return round_half_up(pct_of(rules.program_fee_pct, offer.original_balance_cents))
